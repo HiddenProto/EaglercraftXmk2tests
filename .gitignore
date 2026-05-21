@@ -1,0 +1,10 @@
+# Large/generated files - do not commit
+game.b64
+bundle.js
+epk_inner.bin
+extracted_mdl/
+bumblcat_mdl/
+true_mdl/
+*.b64
+__pycache__/
+*.pyc
