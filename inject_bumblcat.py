@@ -223,77 +223,205 @@ def load_texture_png(obj_dir, name='Handle1_diff.png'):
     return None
 
 # ══════════════════════════════════════════════════════════════════════
-# 6.  Build EAGPKG$$ mini-EPK
+# 6.  Patch winston entries directly inside the main game EPK
 #
-# Verified format from live game EPK (assets.epk):
-#   outer: EAGPKG$$ \x06 ver2.0 \n [name] \x00 R \n\n [comment] \n\n \x00
-#          [12 zero bytes] [gzip-compressed inner] :::YEE:>
-#   inner (decompressed):
-#     HEAD \x09 file-type \x00 \x00\x00\x0d epk/resources
-#     ( >FILE [path_len 1B] [path] \x00 [meta 7B] [data] ) * N
-#     :>END$
-#   meta layout (7 bytes):
-#     meta[0]   = 0x00 uncompressed | 0x01 gzip-per-entry
-#     meta[1:3] = big-endian uint16  = data_size + 4   (verified on two entries)
-#     meta[3:7] = 4-byte checksum    (not validated for resource EPKs -> zeros)
-#   MDL entries need a 0x21 ('!') prefix before EAG$mdlT/EAG$mdlC
+# Strategy: instead of injecting a second EPK (which required a fragile
+# assetsURI hook and a mini-EPK the game's parser might reject), we
+# decompress the ORIGINAL game EPK from the bundle, scan its inner
+# content for the four winston entries, replace their data bytes in-place
+# with bumblcat data, then re-gzip and put the patched EPK back.
+#
+# The game never sees a second EPK — it just loads its own EPK as usual,
+# but the winston MDL/PNG bytes are now bumblcat data.
+#
+# Inner format (decompressed EPK content):
+#   HEAD record: HEAD [key_len 1B] [key] \x00 [val_len 3B BE] [val]
+#   FILE entries:
+#     old format: >FILE [path_len 1B] [path] \x00 [meta 7B] [data]
+#     new format: _:>+:>FILE [path_len 1B] [path] \x00 [meta 7B] [data]
+#   END:  :>END$
+#   meta[0]   = 0x00 raw | 0x01 per-entry gzip
+#   meta[1:3] = big-endian uint16 size_field (formula varies; we rebuild)
+#   meta[3:7] = 4-byte checksum (not validated -> zeros)
+#   MDL data in EPK always starts with 0x21 ('!') before EAG$mdlT/C
 # ══════════════════════════════════════════════════════════════════════
-def build_bumblcat_epk(files_dict):
+def parse_epk_inner(inner: bytes):
     """
-    files_dict: { 'assets/eagler/mesh/foo': bytes, ... }
-    Returns raw EAGPKG$$ EPK bytes ready to be base64-encoded.
-    All data_sizes must satisfy data_size + 4 ≤ 65535 (use gzip-compress
-    individual entries for larger files by setting meta[0]=1 and passing
-    gzip-compressed bytes; pass the compressed bytes as the value).
+    Walk the decompressed inner EPK content.
+    Returns list of dicts:
+      { 'type': 'HEAD'|'FILE'|'END',
+        'raw': bytes,           # original raw bytes for this record
+        'path': str|None,       # FILE only
+        'data': bytes|None,     # FILE only (decompressed if per-entry gz)
+        'comp': int,            # FILE only (0=raw, 1=gz)
+        'marker': bytes }       # b'>FILE' or b'_:>+:>FILE'
     """
-    inner = bytearray()
+    records = []
+    pos = 0
+    n = len(inner)
 
-    # HEAD record
-    key = b'file-type'
-    val = b'epk/resources'
-    inner += b'HEAD'
-    inner += bytes([len(key)])
-    inner += key
-    inner += b'\x00'
-    inner += len(val).to_bytes(3, 'big')
-    inner += val
+    while pos < n:
+        # END marker
+        if inner[pos:pos+6] == b':>END$':
+            records.append({'type': 'END', 'raw': b':>END$',
+                            'path': None, 'data': None,
+                            'comp': 0, 'marker': b''})
+            pos += 6
+            break
 
-    # FILE records  (old >FILE format, verified against live EPK)
-    for epk_path, data in files_dict.items():
-        path_b    = epk_path.encode('ascii')
-        data_size = len(data)
-        size_field = data_size + 4          # verified formula for >FILE entries
-        if size_field > 0xFFFF:
-            raise ValueError(
-                f'EPK entry too large: {epk_path} ({data_size} bytes). '
-                f'Gzip-compress the data before passing it in.')
-        meta  = bytes([0x00]) + size_field.to_bytes(2, 'big') + b'\x00\x00\x00\x00'
-        inner += b'>FILE'
-        inner += bytes([len(path_b)])
-        inner += path_b
-        inner += b'\x00'
-        inner += meta
-        inner += data
+        # HEAD record
+        if inner[pos:pos+4] == b'HEAD':
+            key_len = inner[pos+4]
+            null_after_key = pos + 5 + key_len
+            val_len = struct.unpack('>I', b'\x00' + inner[null_after_key+1:null_after_key+4])[0]
+            end = null_after_key + 4 + val_len
+            records.append({'type': 'HEAD', 'raw': inner[pos:end],
+                            'path': None, 'data': None,
+                            'comp': 0, 'marker': b''})
+            pos = end
+            continue
 
-    # END record (matches actual EPK terminator pattern)
-    inner += b':>END$'
+        # FILE records
+        if inner[pos:pos+10] == b'_:>+:>FILE':
+            marker = b'_:>+:>FILE'; ml = 10
+        elif inner[pos:pos+5] == b'>FILE':
+            marker = b'>FILE';      ml = 5
+        else:
+            pos += 1          # skip unknown byte (shouldn't happen)
+            continue
 
-    # Gzip-compress the inner content (mtime=0 for reproducibility)
+        path_len  = inner[pos + ml]
+        path      = inner[pos+ml+1 : pos+ml+1+path_len].decode('ascii', errors='replace')
+        null_pos  = pos + ml + 1 + path_len
+        meta      = inner[null_pos+1 : null_pos+8]   # 7 bytes
+        comp      = meta[0]
+        size_field= struct.unpack('>H', meta[1:3])[0]
+        data_start= null_pos + 8
+        # Determine data length from size_field (formula differs by marker type,
+        # but we only need to get it right for scanning; see rebuild logic)
+        # Use size_field - 4 as a best-guess; verify by scanning for next marker.
+        guess_len = max(0, size_field - 4)
+        guess_end = data_start + guess_len
+        # Scan ONLY near the expected boundary (±50 bytes) so binary data
+        # inside large entries cannot accidentally match a marker pattern.
+        scan_from = max(data_start, guess_end - 4)
+        scan_to   = min(n, guess_end + 50)
+        true_end  = None
+        for off in range(scan_from, scan_to):
+            chunk = inner[off:off+10]
+            if (chunk[:10] == b'_:>+:>FILE'
+                    or chunk[:5] == b'>FILE'
+                    or chunk[:6] == b':>END$'
+                    or chunk[:4] == b'HEAD'):
+                true_end = off
+                break
+        if true_end is None:
+            true_end = guess_end   # trust size_field; last entry hits EOF
+        raw_data = inner[data_start:true_end]
+        if comp == 1:
+            try:
+                file_data = gzip.decompress(raw_data)
+            except Exception:
+                file_data = raw_data   # fallback
+        else:
+            file_data = raw_data
+        records.append({'type': 'FILE', 'raw': inner[pos:true_end],
+                        'path': path, 'data': file_data,
+                        'comp': comp, 'marker': marker})
+        pos = true_end
+
+    return records
+
+
+def rebuild_epk_inner(records, replacements: dict) -> bytes:
+    """
+    Rebuild inner EPK content, applying replacements where path matches.
+    replacements: { 'assets/eagler/mesh/winston0.mdl': new_bytes, ... }
+
+    Non-replaced entries: written verbatim (preserves original comp/format).
+    Replaced entries: written as raw >FILE entries (comp=0) so the game
+    reads them with its normal uncompressed-entry path.  The outer gzip
+    already compresses the entire inner content.
+    """
+    out = bytearray()
+    replaced_count = 0
+    for rec in records:
+        if rec['type'] == 'HEAD':
+            out += rec['raw']
+        elif rec['type'] == 'END':
+            out += b':>END$'
+        elif rec['type'] == 'FILE':
+            path = rec['path']
+            if path in replacements:
+                # Write replacement as raw (comp=0) >FILE entry.
+                data       = replacements[path]
+                path_b     = path.encode('ascii')
+                size_field = len(data) + 4
+                meta       = bytes([0x00]) + size_field.to_bytes(2, 'big') + b'\x00\x00\x00\x00'
+                out += b'>FILE'
+                out += bytes([len(path_b)])
+                out += path_b
+                out += b'\x00'
+                out += meta
+                out += data
+                replaced_count += 1
+                log(f'    Replaced EPK entry: {path} ({len(data):,} bytes)')
+            else:
+                # Preserve original bytes exactly — no reformatting.
+                out += rec['raw']
+    if replaced_count == 0:
+        log('  WARNING: no EPK entries were replaced — check path names!')
+    else:
+        log(f'  Replaced {replaced_count} EPK entries')
+    return bytes(out)
+
+
+def patch_epk_bytes(epk_bytes: bytes, replacements: dict) -> bytes:
+    """
+    Given raw EAGPKG$$ EPK bytes and a dict of path->new_data replacements,
+    return patched EPK bytes with the same outer header.
+    """
+    # Locate gzip region
+    comment_end = epk_bytes.index(b'\n\n\x00')
+    gz_start    = comment_end + 3 + 12      # +3 for '\n\n\x00', +12 for meta
+    suffix_pos  = epk_bytes.rfind(b':::YEE:>')
+    gz_data     = epk_bytes[gz_start:suffix_pos]
+
+    # Decompress, parse, rebuild
+    inner       = gzip.decompress(gz_data)
+    records     = parse_epk_inner(inner)
+    patched_inner = rebuild_epk_inner(records, replacements)
+
+    # Re-gzip
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=9, mtime=0) as gz:
-        gz.write(inner)
-    gz_data = buf.getvalue()
+        gz.write(patched_inner)
+    new_gz = buf.getvalue()
 
-    # EAGPKG$$ outer wrapper  (verified from actual game EPK header)
-    name    = b'bumblcat.epk'
-    comment = b' #  Bumblcat skin asset pack\n #  generated by inject_bumblcat.py'
-    outer = (b'EAGPKG$$\x06ver2.0\n'
-             + name + b'\x00R\n\n'
-             + comment + b'\n\n\x00'
-             + bytes(12)           # 12 zero-bytes meta field
-             + gz_data
-             + b':::YEE:>')
-    return outer
+    return epk_bytes[:gz_start] + new_gz + b':::YEE:>'
+
+
+def patch_epk_in_bundle(js: bytes, replacements: dict) -> bytes:
+    """
+    Find the assetsURI data URI in the bundle JS, decode/patch/re-encode the EPK.
+    """
+    # Locate:  assetsURI = [ { url: "data:application/octet-stream;base64,XXXX"
+    marker = b'assetsURI = [ { url: "data:application/octet-stream;base64,'
+    idx = js.find(marker)
+    if idx < 0:
+        raise RuntimeError('assetsURI data URI not found in bundle JS')
+    b64_start = idx + len(marker)
+    b64_end   = js.index(b'"', b64_start)
+    epk_b64   = js[b64_start:b64_end]
+    pad = (-len(epk_b64)) % 4
+    epk_bytes = base64.b64decode(epk_b64 + b'=' * pad)
+    log(f'  Found EPK in bundle: {len(epk_bytes):,} raw bytes')
+
+    patched_epk = patch_epk_bytes(epk_bytes, replacements)
+    log(f'  Patched EPK: {len(patched_epk):,} bytes')
+
+    new_b64 = base64.b64encode(patched_epk)
+    return js[:b64_start] + new_b64 + js[b64_end:]
 
 # ══════════════════════════════════════════════════════════════════════
 # 7.  Bundle extraction / re-compression helpers
@@ -338,7 +466,12 @@ def patch_pool_string(pool: bytes, old_str: str, new_str: str,
     return result
 
 def patch_bundle(js: bytes) -> bytes:
-    """Apply all string-pool patches to the decompressed JS bundle."""
+    """
+    Apply string-pool patches to the decompressed JS bundle.
+    With the direct-EPK approach we only rename the display name;
+    the asset paths (winston*.mdl / winston.png) stay unchanged because
+    the EPK itself keeps those paths — we only swap the data bytes.
+    """
     pool_start = js.find(b'$rt_stringPool([')
     pool_end   = js.find(b']);', pool_start)
     if pool_start < 0:
@@ -347,26 +480,6 @@ def patch_bundle(js: bytes) -> bytes:
 
     log('  Patching display name: Baby Winston -> Bumblcat')
     pool = patch_pool_string(pool, 'Baby Winston', 'Bumblcat')
-
-    log('  Patching asset path: winston.fallback.png -> bumblcat.fallback.png')
-    pool = patch_pool_string(pool,
-                             'eagler:mesh/winston.fallback.png',
-                             'eagler:mesh/bumblcat.fallback.png')
-
-    log('  Patching asset path: winston.png -> bumblcat.png')
-    pool = patch_pool_string(pool,
-                             'eagler:mesh/winston.png',
-                             'eagler:mesh/bumblcat.png')
-
-    log('  Patching asset path: winston0.mdl -> bumblcat0.mdl')
-    pool = patch_pool_string(pool,
-                             'eagler:mesh/winston0.mdl',
-                             'eagler:mesh/bumblcat0.mdl')
-
-    log('  Patching asset path: winston1.mdl -> bumblcat1.mdl')
-    pool = patch_pool_string(pool,
-                             'eagler:mesh/winston1.mdl',
-                             'eagler:mesh/bumblcat1.mdl')
 
     return js[:pool_start] + pool + js[pool_end+2:]
 
@@ -519,7 +632,7 @@ def save_assets_to_dir(assets_dir, mdl0, mdl1, tex, fallback):
 # 11. MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    log('=== Bumblcat skin injector ===')
+    log('=== Bumblcat skin injector (direct EPK patch) ===')
 
     # ── 1. Obtain bumblcat assets ──────────────────────────────────────
     assets_marker = os.path.join(ASSETS_DIR, 'bumblcat0.mdl')
@@ -537,7 +650,6 @@ def main():
         log(f'Saving assets to {ASSETS_DIR} ...')
         save_assets_to_dir(ASSETS_DIR, mdl0_bytes, mdl1_bytes,
                            tex_bytes, fallback_bytes)
-        # Also write the raw MDL/PNG files for inspection
         os.makedirs(MDL_DIR, exist_ok=True)
         for name, data in [('bumblcat0.mdl',        mdl0_bytes),
                            ('bumblcat1.mdl',         mdl1_bytes),
@@ -546,34 +658,22 @@ def main():
             with open(os.path.join(MDL_DIR, name), 'wb') as f:
                 f.write(data)
 
-    # ── 2. Build mini-EPK ─────────────────────────────────────────────
-    # MDL data stored in the EPK must be prefixed with 0x21 ('!')
-    # (verified against all winston*.mdl entries in the live game EPK)
-    log('Building bumblcat mini-EPK ...')
-    epk_files = {
-        'assets/eagler/mesh/bumblcat.fallback.png': fallback_bytes,
-        'assets/eagler/mesh/bumblcat.png':          tex_bytes,
-        'assets/eagler/mesh/bumblcat0.mdl':         b'\x21' + mdl0_bytes,
-        'assets/eagler/mesh/bumblcat1.mdl':         b'\x21' + mdl1_bytes,
+    # ── 2. Build replacement map (winston paths -> bumblcat data) ──────
+    # Strategy: the main game EPK contains four winston entries.  We keep
+    # the paths identical (game still requests winston* paths) but replace
+    # the raw data bytes with bumblcat content.  MDL data must have the
+    # 0x21 ('!') prefix that the game EPK format expects.
+    replacements = {
+        'assets/eagler/mesh/winston.fallback.png': fallback_bytes,
+        'assets/eagler/mesh/winston.png':          tex_bytes,
+        'assets/eagler/mesh/winston0.mdl':         b'\x21' + mdl0_bytes,
+        'assets/eagler/mesh/winston1.mdl':         b'\x21' + mdl1_bytes,
     }
-    for path, data in epk_files.items():
-        size_field = len(data) + 4
-        if size_field > 0xFFFF:
-            raise ValueError(
-                f'EPK entry too large for 2-byte size_field: {path} '
-                f'(data={len(data)} bytes).  Reduce mesh complexity or '
-                f'gzip-compress the entry.')
-        log(f'  {path}: {len(data):,} bytes  size_field={size_field}')
+    log('Replacement plan:')
+    for path, data in replacements.items():
+        log(f'  {path}: {len(data):,} bytes')
 
-    epk_bytes = build_bumblcat_epk(epk_files)
-    epk_b64   = base64.b64encode(epk_bytes).decode('ascii')
-    log(f'  EPK: {len(epk_bytes):,} bytes  ->  base64: {len(epk_b64):,} chars')
-
-    # ── 3. Build JS injection script ───────────────────────────────────
-    log('Building injection script ...')
-    injection = build_injection_script(epk_b64)
-
-    # ── 4. Load + patch HTML ───────────────────────────────────────────
+    # ── 3. Load HTML and extract bundle ───────────────────────────────
     log(f'Reading {HTML_IN} ...')
     with open(HTML_IN, 'rb') as f:
         html = f.read()
@@ -586,30 +686,24 @@ def main():
     js_bundle = decompress_bundle(raw_bundle)
     log(f'  Decompressed: {len(js_bundle):,} bytes')
 
+    # ── 4. String-pool patch (display name only) ───────────────────────
     log('Applying string-pool patches ...')
     js_patched = patch_bundle(js_bundle)
 
+    # ── 5. Patch the EPK data inside the bundle JS ────────────────────
+    log('Patching EPK inside bundle ...')
+    js_patched = patch_epk_in_bundle(js_patched, replacements)
+
+    # ── 6. Recompress bundle ───────────────────────────────────────────
     log('Recompressing bundle ...')
     raw_patched = recompress_bundle(js_patched)
     log(f'  Recompressed: {len(raw_patched):,} bytes  '
         f'(delta {len(raw_patched)-len(raw_bundle):+,})')
 
-    new_b64 = base64.b64encode(raw_patched).decode('ascii').encode('ascii')
+    new_b64 = base64.b64encode(raw_patched)   # bytes, not str
 
-    # Find the <script ...> tag that wraps the bundle element
-    bundle_script_start = html.rfind(b'<script', 0, b64_start)
-
-    # Assemble new HTML:
-    #   [everything before bundle <script>]
-    #   [bumblcatInjector <script>]
-    #   [bundle <script> with patched b64]
-    #   [rest of HTML]
-    html_new = (html[:bundle_script_start]
-                + injection.encode('utf-8')
-                + b'\n'
-                + html[bundle_script_start:b64_start]
-                + new_b64
-                + html[b64_end:])
+    # ── 7. Assemble output HTML (no injection script needed) ──────────
+    html_new = html[:b64_start] + new_b64 + html[b64_end:]
 
     log(f'Writing {HTML_OUT} ...')
     with open(HTML_OUT, 'wb') as f:
